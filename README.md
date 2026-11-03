@@ -35,7 +35,7 @@ Edge Flash is a transparent, click-through overlay for Windows that sits on top 
 
 The tray icon menu has palettes, dimming, lasers, the beat analysis toggle and latency recalibration. Settings and your best score are remembered.
 
-While a session is off, Edge Flash ignores the keyboard and everything reaches your apps as usual. While it is on, the mapped keys trigger lights and are **not** typed into the active window, so you can drum without messing up your work. Shortcuts with Ctrl, Alt or Win still work.
+While a session is off, Edge Flash only listens for its three shortcuts and everything else reaches your apps as usual. When you start a session it takes keyboard focus, so your keys trigger lights instead of being typed into your work. Ending the session gives focus back to the window you were using. Clicking another window or pressing Alt+Tab ends the session too.
 
 ## Install
 
@@ -54,11 +54,14 @@ python -m venv .venv
 .venv\Scripts\pythonw edge_flash.py
 ```
 
-## Privacy and antivirus
+## Privacy
 
-Edge Flash uses a global keyboard hook (via `pynput`) to react to keys while other apps are focused, the same mechanism keyloggers use. Nothing is stored or sent anywhere: keys only trigger lights, and audio is analyzed in memory and never recorded.
+Edge Flash does not hook or monitor your keyboard.
 
-Because of the hook, some antivirus tools may quarantine `pynput`. If the app stops starting after the first run, check your antivirus history. Avoid running it on a managed work computer without asking your IT team.
+- The shortcuts are registered with [`RegisterHotKey`](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-registerhotkey), the standard Windows API for global hotkeys. Windows only notifies the app when those exact combinations are pressed.
+- During a session, a tiny invisible window takes keyboard focus and receives keys like any foreground app. It never sees what you type in other windows.
+- Audio is captured from your PC's output (WASAPI loopback, no microphone), analyzed in memory and never recorded.
+- Nothing is stored or sent anywhere, apart from your settings and best score in the Windows registry.
 
 ## How the beat detection works
 

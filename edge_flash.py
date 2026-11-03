@@ -8,10 +8,12 @@ Esc         spegne la modalità fidget
 Icona nella tray (vicino all'orologio): palette, scurimento, laser, analisi musica, esci.
 Le impostazioni vengono ricordate al prossimo avvio.
 
-Quando la modalità è SPENTA l'app non reagisce a niente e i tasti arrivano
-normalmente alle tue app. Quando è ACCESA i tasti "musicali" (lettere, numeri,
-spazio, invio, frecce) fanno i flash e NON vengono scritti nella finestra
-attiva, così non sporchi il documento su cui stai lavorando.
+TASTIERA: niente keylogger. Le tre scorciatoie sono registrate con RegisterHotKey,
+l'API standard di Windows per i tasti rapidi globali: Windows avvisa l'app solo
+quando premi quelle combinazioni. Durante la sessione Edge Flash prende il focus
+con una finestrella invisibile e riceve i tasti come qualsiasi app in primo piano;
+quando chiudi la sessione il focus torna alla finestra su cui stavi lavorando.
+Se clicchi su un'altra finestra o fai Alt+Tab, la sessione si chiude da sola.
 Nessun tasto viene salvato o inviato da nessuna parte.
 
 ANALISI MUSICA: l'app ascolta l'audio in uscita dal PC (non il microfono),
@@ -21,18 +23,19 @@ L'audio viene analizzato al volo e mai registrato.
 """
 
 import cmath
+import ctypes
 import math
 import random
 import sys
 import threading
 import time
 from collections import deque
+from ctypes import wintypes
 
-from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSettings, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QIcon, QLinearGradient,
                            QPainter, QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
-from pynput import keyboard
 
 try:
     import numpy as np
@@ -44,7 +47,6 @@ except Exception:  # librerie mancanti: l'app funziona lo stesso, senza analisi
 # ---------------------------------------------------------------- impostazioni
 LIFE = 0.7            # durata di un flash in secondi
 LASER_LIFE = 0.55     # durata di un laser in secondi
-SUPPRESS_KEYS = True  # in modalità fidget i tasti non arrivano alle altre app
 
 # Scurimento dello schermo mentre la modalità fidget è accesa (0 = niente, 1 = nero)
 DIM_LEVELS = {"Spento": 0.0, "Leggero": 0.35, "Medio": 0.55, "Forte": 0.75}
@@ -127,12 +129,10 @@ KEYMAP.update({
     0x28: ("B", 0.5, 0.5, False),   # freccia giù
 })
 
-VK_CTRL = {0x11, 0xA2, 0xA3}
-VK_ALT = {0x12, 0xA4, 0xA5}
-VK_WIN = {0x5B, 0x5C}
-VK_ESC = 0x1B
 VK_F, VK_D, VK_L = 0x46, 0x44, 0x4C
-WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP = 0x100, 0x101, 0x104, 0x105
+MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
+WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
+user32 = ctypes.windll.user32 if sys.platform == "win32" else None
 
 
 # ================================================================ analisi audio
@@ -263,14 +263,125 @@ class BeatAnalyzer:
         self.grid = (P, phase, conf) if conf > 0.3 else None
 
 
-# ================================================================ overlay
+# ================================================================ tastiera
 class KeyBridge(QObject):
-    """Porta gli eventi dal thread di pynput al thread di Qt."""
-    flash = Signal(str, float, float, bool, float)
+    """Segnali emessi dal thread dei tasti rapidi."""
     toggle = Signal()
-    off = Signal()
     cycle_dim = Signal()
     cycle_laser = Signal()
+
+
+class HotkeyActions(QObject):
+    """Riceve le scorciatoie nel thread principale, dove si può toccare la grafica."""
+
+    def __init__(self, toggle, cycle_dim, cycle_laser):
+        super().__init__()
+        self._toggle, self._dim, self._laser = toggle, cycle_dim, cycle_laser
+
+    @Slot()
+    def toggle(self):
+        self._toggle()
+
+    @Slot()
+    def cycle_dim(self):
+        self._dim()
+
+    @Slot()
+    def cycle_laser(self):
+        self._laser()
+
+
+class HotkeyThread(threading.Thread):
+    """Registra Ctrl+Alt+F/D/L con RegisterHotKey e avvisa Qt quando li premi.
+
+    Windows manda all'app solo queste combinazioni: il resto della tastiera
+    non passa mai di qui.
+    """
+
+    def __init__(self, keys):
+        super().__init__(daemon=True)
+        self.keys = list(keys.items())   # [(codice tasto, segnale)]
+        self.thread_id = None
+        self.failed = []
+        self.ready = threading.Event()
+
+    def run(self):
+        self.thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        for hk_id, (code, _) in enumerate(self.keys, start=1):
+            if not user32.RegisterHotKey(None, hk_id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, code):
+                self.failed.append(code)
+        self.ready.set()
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_HOTKEY and 1 <= msg.wParam <= len(self.keys):
+                self.keys[msg.wParam - 1][1].emit()
+        for hk_id in range(1, len(self.keys) + 1):
+            user32.UnregisterHotKey(None, hk_id)
+
+    def stop(self):
+        if self.thread_id:
+            user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+
+
+class KeyCatcher(QWidget):
+    """Finestrella invisibile che durante la sessione riceve i tasti, come una normale app."""
+
+    def __init__(self, on_key, on_escape, on_lost):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        # quasi invisibile ma "vera": Windows dà il focus solo a finestre che esistono a schermo
+        self.setWindowOpacity(0.01)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.resize(1, 1)
+        self.on_key, self.on_escape, self.on_lost = on_key, on_escape, on_lost
+        self.in_session = False
+        self.got_focus = False
+        self.previous = None
+
+    def grab(self, screen):
+        """Prende il focus della tastiera, ricordando quale finestra lo aveva."""
+        self.previous = user32.GetForegroundWindow()
+        g = screen.geometry()
+        self.move(g.right() - 1, g.bottom() - 1)
+        self.in_session = True
+        self.got_focus = False
+        self.show()
+        self.raise_()
+        user32.SetForegroundWindow(int(self.winId()))
+        self.activateWindow()
+        self.setFocus()
+
+    def release(self, restore=True):
+        """Lascia il focus e lo restituisce alla finestra su cui stavi lavorando."""
+        self.in_session = False
+        self.hide()
+        if restore and self.previous and user32.IsWindow(self.previous):
+            user32.SetForegroundWindow(self.previous)
+        self.previous = None
+
+    def keyPressEvent(self, e):
+        t = time.perf_counter()  # istante del tasto, per il giudizio sul tempo
+        if e.isAutoRepeat():
+            return
+        if e.key() == Qt.Key_Escape:
+            self.on_escape()
+            return
+        if e.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return
+        m = KEYMAP.get(e.nativeVirtualKey())
+        if m:
+            self.on_key(*m, t)
+
+    def changeEvent(self, e):
+        if e.type() == QEvent.ActivationChange and self.in_session:
+            if self.isActiveWindow():
+                self.got_focus = True
+            elif self.got_focus:
+                # hai cliccato altrove o fatto Alt+Tab: la sessione finisce qui
+                QTimer.singleShot(0, self.on_lost)
+        super().changeEvent(e)
+
+
+# ================================================================ overlay
 
 
 class Overlay(QWidget):
@@ -764,6 +875,8 @@ def radio_menu(parent_menu, title, options, current, on_pick):
 
 
 def main():
+    if sys.platform != "win32":
+        sys.exit("Edge Flash funziona solo su Windows.")
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     settings = QSettings("EdgeFlash", "EdgeFlash")
@@ -791,7 +904,6 @@ def main():
     tempo_timer.start(400)
 
     bridge = KeyBridge()
-    bridge.flash.connect(overlay.fire)
 
     # ---------------------------------------------------------- tray
     tray = QSystemTrayIcon(make_icon(False))
@@ -851,75 +963,62 @@ def main():
     tray.setContextMenu(menu)
     tray.show()
 
-    def set_armed(on):
+    def set_armed(on, restore_focus=True):
+        if on == overlay.armed:
+            return
         overlay.set_armed(on)
-        state["armed"] = on
+        if on:
+            catcher.grab(app.primaryScreen())
+            QTimer.singleShot(500, check_focus)
+        else:
+            catcher.release(restore_focus)
         tray.setIcon(make_icon(on))
         act_toggle.setText(("Spegni" if on else "Accendi") + " (Ctrl+Alt+F)")
 
-    bridge.toggle.connect(lambda: set_armed(not overlay.armed))
-    bridge.off.connect(lambda: set_armed(False))
-    bridge.cycle_dim.connect(lambda: cycle(DIM_LEVELS, overlay.dim_name, set_dim))
-    bridge.cycle_laser.connect(lambda: cycle(LASER_MODES, overlay.laser_mode, set_laser))
+    def check_focus():
+        # Windows a volte nega il focus: meglio dirlo che restare accesi senza tasti
+        if overlay.armed and not catcher.got_focus:
+            set_armed(False, restore_focus=False)
+            tray.showMessage("Edge Flash", "Non sono riuscito a prendere la tastiera. "
+                             "Riprova con Ctrl+Alt+F.", make_icon(False), 3000)
+
+    catcher = KeyCatcher(on_key=overlay.fire,
+                         on_escape=lambda: set_armed(False),
+                         on_lost=lambda: set_armed(False, restore_focus=False))
+
+    actions = HotkeyActions(
+        toggle=lambda: set_armed(not overlay.armed),
+        cycle_dim=lambda: cycle(DIM_LEVELS, overlay.dim_name, set_dim),
+        cycle_laser=lambda: cycle(LASER_MODES, overlay.laser_mode, set_laser))
+    bridge.toggle.connect(actions.toggle, Qt.QueuedConnection)
+    bridge.cycle_dim.connect(actions.cycle_dim, Qt.QueuedConnection)
+    bridge.cycle_laser.connect(actions.cycle_laser, Qt.QueuedConnection)
     act_toggle.triggered.connect(lambda: set_armed(not overlay.armed))
     tray.activated.connect(lambda reason: reason == QSystemTrayIcon.Trigger
                            and set_armed(not overlay.armed))
 
-    # ---------------------------------------------------------- tastiera globale
-    state = {"armed": False}
-    held = set()
-    hotkeys = {VK_F: bridge.toggle, VK_D: bridge.cycle_dim, VK_L: bridge.cycle_laser}
-
-    def win32_filter(msg, data):
-        t = time.perf_counter()  # istante esatto del tasto, per il giudizio sul tempo
-        code = data.vkCode
-        down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
-        up = msg in (WM_KEYUP, WM_SYSKEYUP)
-        is_repeat = down and code in held
-        if down:
-            held.add(code)
-        elif up:
-            held.discard(code)
-
-        mods = held & (VK_CTRL | VK_ALT | VK_WIN)
-        ctrl = bool(held & VK_CTRL)
-        alt = bool(held & VK_ALT)
-
-        if down and ctrl and alt and code in hotkeys:
-            if not is_repeat:
-                hotkeys[code].emit()
-            listener.suppress_event()
-            return False
-
-        if not state["armed"]:
-            return False  # spento: non tocca niente
-        if down and code == VK_ESC:
-            bridge.off.emit()
-            return False
-        if mods - {code}:
-            return False  # scorciatoie (Alt+Tab, Ctrl+C...) passano normalmente
-
-        m = KEYMAP.get(code)
-        if m is None:
-            return False
-        if down and not is_repeat:
-            bridge.flash.emit(*m, t)
-        if SUPPRESS_KEYS:
-            listener.suppress_event()
-        return False
-
-    listener = keyboard.Listener(win32_event_filter=win32_filter)
-    listener.start()
+    # ---------------------------------------------------------- scorciatoie globali
+    hotkeys = HotkeyThread({VK_F: bridge.toggle, VK_D: bridge.cycle_dim,
+                            VK_L: bridge.cycle_laser})
+    hotkeys.start()
+    hotkeys.ready.wait(2)
 
     def quit_app():
-        listener.stop()
+        if overlay.armed:
+            set_armed(False)
+        hotkeys.stop()
         analyzer.stop()
         app.quit()
 
     act_quit.triggered.connect(quit_app)
 
-    tray.showMessage("Edge Flash", "Pronto. Premi Ctrl+Alt+F per accendere i flash.",
-                     make_icon(True), 3000)
+    if hotkeys.failed:
+        taken = ", ".join("Ctrl+Alt+" + chr(c) for c in hotkeys.failed)
+        tray.showMessage("Edge Flash", f"{taken} già usata da un'altra app. "
+                         "Puoi usare il menu dell'icona.", make_icon(False), 5000)
+    else:
+        tray.showMessage("Edge Flash", "Pronto. Premi Ctrl+Alt+F per accendere i flash.",
+                         make_icon(True), 3000)
     sys.exit(app.exec())
 
 

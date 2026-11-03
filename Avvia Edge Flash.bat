@@ -14,7 +14,7 @@ if not exist ".venv\Scripts\pythonw.exe" (
 
 if not exist ".venv\librerie_v2.ok" (
     echo Installo le librerie...
-    ".venv\Scripts\python.exe" -m pip install PySide6 pynput numpy PyAudioWPatch || (echo Installazione non riuscita. & pause & exit /b 1)
+    ".venv\Scripts\python.exe" -m pip install PySide6 numpy PyAudioWPatch || (echo Installazione non riuscita. & pause & exit /b 1)
     echo ok> ".venv\librerie_v2.ok"
 )
 
