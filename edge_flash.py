@@ -1,9 +1,22 @@
 """
 Edge Flash - overlay di flash e laser ai bordi dello schermo, a tempo di musica.
 
+LUCI: la posizione del tasto sulla tastiera decide tutto. La direzione del tasto
+rispetto al centro della tastiera diventa la direzione della luce sullo schermo,
+a 360 gradi. La distanza dal centro decide l'intensità: G, H, T, Y fanno le luci
+più forti (secche, intense, con i laser), i tasti sul bordo della tastiera quelle
+più morbide (lente, ampie, tenui). La barra spaziatrice è lo special.
+
+DISEGNO: sulla GPU. L'overlay è una finestra OpenGL trasparente composta da Windows, e
+tutti gli effetti sono immagini preparate una volta sola e caricate sulla scheda video
+all'avvio: durante la sessione la GPU le scala, le ruota e le sfuma da sé, senza che la
+CPU rigeneri o ricarichi niente. Se la tua scheda video dà problemi (per esempio uno
+sfondo nero invece che trasparente), dal menu della tray scegli Rendering > CPU.
+
 Ctrl+Alt+F  accende / spegne la modalità fidget
 Ctrl+Alt+D  cambia quanto viene scurito lo schermo (spento, leggero, medio, forte)
 Ctrl+Alt+L  laser: spenti, insieme ai flash, solo laser
+Ctrl+Alt+M  modalità: Quiet (punteggio discreto in alto) o Loud (punteggio grande al centro)
 Esc         spegne la modalità fidget
 Icona nella tray (vicino all'orologio): palette, scurimento, laser, analisi musica, esci.
 Le impostazioni vengono ricordate al prossimo avvio.
@@ -19,12 +32,16 @@ Nessun tasto viene salvato o inviato da nessuna parte.
 ANALISI MUSICA: l'app ascolta l'audio in uscita dal PC (non il microfono),
 trova i colpi della canzone e ricava BPM e battute. A ogni tap ti dice se eri
 a tempo. La latenza delle cuffie viene calibrata da sola sui primi tap.
+Misura anche l'energia del momento: luci morbide nelle parti calme e luci forti
+in quelle cariche valgono più punti, e lo special vale un bonus se lo usi sul drop.
 L'audio viene analizzato al volo e mai registrato.
 """
 
 import cmath
 import ctypes
 import math
+import os
+import subprocess
 import random
 import sys
 import threading
@@ -32,10 +49,18 @@ import time
 from collections import deque
 from ctypes import wintypes
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSettings, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QIcon, QLinearGradient,
-                           QPainter, QPen, QPixmap, QRadialGradient)
+from PySide6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, QSettings, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics, QIcon, QImage,
+                           QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient,
+                           QRegion)
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+
+try:  # disegno sulla GPU: QPainter su una superficie OpenGL usa il motore accelerato di Qt
+    from PySide6.QtGui import QSurfaceFormat
+    from PySide6.QtOpenGL import QOpenGLWindow
+    GPU_AVAILABLE = True
+except Exception:
+    GPU_AVAILABLE = False
 
 try:
     import numpy as np
@@ -45,8 +70,30 @@ except Exception:  # librerie mancanti: l'app funziona lo stesso, senza analisi
     AUDIO_AVAILABLE = False
 
 # ---------------------------------------------------------------- impostazioni
-LIFE = 0.7            # durata di un flash in secondi
+LIFE = 0.7            # durata di un flash forte in secondi
+SOFT_LIFE = 1.6       # durata di una luce morbida (sale piano e svanisce piano)
+SOFT_ATTACK = 0.18    # secondi per arrivare al massimo, per le luci morbide
 LASER_LIFE = 0.55     # durata di un laser in secondi
+SPECIAL_LIFE = 1.1    # durata dell'effetto della barra spaziatrice
+SPECIAL_COOLDOWN = 0.6  # lo special non si ripete più spesso di così
+
+LASER_MIN_POWER = 0.6   # i laser partono solo dai tasti abbastanza vicini al centro
+
+# Prestazioni
+FRAME_MS = 16           # ~60 fotogrammi al secondo, solo quando c'è qualcosa da animare
+MAX_FLASHES = 40        # luci contemporanee al massimo (le più vecchie lasciano il posto)
+MAX_LASERS = 12
+SPRITE_SIZE = 128       # risoluzione degli aloni pre-renderizzati (vengono scalati)
+
+# Energia della canzone (volume rispetto alla sua stessa dinamica, 0..1).
+# Il punteggio confronta l'intensità del tasto con l'energia del momento.
+ENERGY_TOLERANCE = 0.25   # entro questa differenza la luce è "giusta"
+ENERGY_OFF = 0.5          # oltre questa differenza è proprio fuori luogo
+ENERGY_PEAK = 0.8         # sopra: picco, il momento dello special
+ENERGY_RISE = 0.25        # ...oppure energia alta che sale così tanto in un secondo (il drop)
+ENERGY_MATCH = 1.5        # moltiplicatore se la luce è adatta al momento
+ENERGY_MISMATCH = 0.5     # moltiplicatore se è fuori luogo
+DROP_BONUS = 1000         # bonus per lo special al picco
 
 # Scurimento dello schermo mentre la modalità fidget è accesa (0 = niente, 1 = nero)
 DIM_LEVELS = {"Spento": 0.0, "Leggero": 0.35, "Medio": 0.55, "Forte": 0.75}
@@ -54,6 +101,15 @@ DIM_TINT = (6, 4, 14)  # nero leggermente violaceo, più morbido del nero puro
 DIM_FADE = 0.25        # secondi per scurire / schiarire
 
 LASER_MODES = ["Spenti", "Con i flash", "Solo laser"]
+RENDERERS = ["GPU", "CPU (compatibilità)"]
+# Quiet: punteggio e analisi discreti in alto a destra.
+# Loud: punteggio grande al centro che cresce, colonna dei giudizi sopra, analisi a sinistra.
+MODES = ["Quiet", "Loud"]
+FEED_LENGTH = 6          # giudizi visibili nella colonna della modalità Loud
+FEED_LIFE = 3.5          # secondi prima che un giudizio sparisca del tutto
+LABEL_SIZE = 44          # dimensione delle scritte dei giudizi in modalità Loud
+EXTRA_LABELS = [("DROP!", (255, 90, 210)), ("SAVE IT!", (255, 150, 80)),
+                ("CALIBRATING", (180, 176, 200))]
 
 # Giudizi sul tempo: (errore massimo in ms, scritta, colore, punti, peso nella precisione)
 JUDGEMENTS = [
@@ -83,53 +139,69 @@ PALETTES = {
 
 # ---------------------------------------------------------------- mappa tasti
 # Codici virtuali Windows, layout QWERTY italiano.
-# Ogni voce: (bordo, posizione lungo il bordo 0..1, sfumatura colore 0..1, onda grande)
+# Ogni tasto ha una posizione sulla tastiera. Da quella posizione nascono:
+#   - la DIREZIONE della luce: la direzione del tasto rispetto al centro della tastiera
+#     diventa la direzione rispetto al centro dello schermo, a 360 gradi
+#   - l'INTENSITÀ: 1 al centro della tastiera (luce forte, secca, con laser),
+#     0 sul bordo (luce morbida, lenta, tenue), con tutte le sfumature in mezzo
+# Ogni voce: (bordo, posizione lungo il bordo 0..1, angolo in gradi, onda grande, intensità)
+# L'intensità "special" è la barra spaziatrice.
 def vk(ch):
     return ord(ch)
 
-KEYMAP = {}
-
-# Bordo SUPERIORE: riga dei numeri  \ 1 2 3 4 5 6 7 8 9 0 ' ì
-TOP = [0xDC] + [vk(c) for c in "1234567890"] + [0xDB, 0xDD]
-for i, code in enumerate(TOP):
-    t = i / (len(TOP) - 1)
-    KEYMAP[code] = ("T", 0.06 + t * 0.88, t, False)
-
-# Bordi LATERALI: Q e A divise tra le due mani, più gli estremi della riga in basso.
-LEFT = [
-    [vk(c) for c in "QWERT"],
-    [vk(c) for c in "ASDFG"],
-    [0xE2] + [vk(c) for c in "ZXC"],          # <  z  x  c
+KEYBOARD_ROWS = [  # (spostamento della riga in larghezze di tasto, tasti da sinistra)
+    (0.0,  [0xDC] + [vk(c) for c in "1234567890"] + [0xDB, 0xDD]),       # \ 1 … 0 ' ì
+    (1.5,  [vk(c) for c in "QWERTYUIOP"] + [0xBA, 0xBB]),                 # q … p è +
+    (1.75, [vk(c) for c in "ASDFGHJKL"] + [0xC0, 0xDE, 0xBF]),            # a … l ò à ù
+    (1.25, [0xE2] + [vk(c) for c in "ZXCVBNM"] + [0xBC, 0xBE, 0xBD]),     # < z … m , . -
 ]
-RIGHT = [
-    [vk(c) for c in "YUIOP"] + [0xBA, 0xBB],  # y u i o p è +
-    [vk(c) for c in "HJKL"] + [0xC0, 0xDE, 0xBF],  # h j k l ò à ù
-    [0xBC, 0xBE, 0xBD],                       # ,  .  -
-]
-ROW_Y = (0.22, 0.5, 0.78)
-for side, rows in (("L", LEFT), ("R", RIGHT)):
-    for r, row in enumerate(rows):
-        for c, code in enumerate(row):
-            t = c / max(len(row) - 1, 1)
-            outer = 1 - t if side == "L" else t
-            KEYMAP[code] = (side, ROW_Y[r] - 0.09 + 0.18 * (1 - outer), t, False)
 
-# Bordo INFERIORE: v b n m al centro, spazio come onda larga
-BOTTOM = [vk(c) for c in "VBNM"]
-for i, code in enumerate(BOTTOM):
-    t = i / (len(BOTTOM) - 1)
-    KEYMAP[code] = ("B", 0.3 + t * 0.4, t, False)
-KEYMAP[0x20] = ("B", 0.5, 0.5, True)          # spazio
 
+def edge_point(dx, dy):
+    """Punto sul bordo dello schermo nella direzione (dx, dy) dal centro."""
+    m = max(abs(dx), abs(dy)) or 1.0
+    bx, by = dx / m, dy / m
+    if abs(bx) >= abs(by):
+        return ("L" if bx < 0 else "R"), min(0.96, max(0.04, (by + 1) / 2))
+    return ("T" if by < 0 else "B"), min(0.96, max(0.04, (bx + 1) / 2))
+
+
+def build_keymap():
+    keys = [(code, start + i + 0.5, row)
+            for row, (start, codes) in enumerate(KEYBOARD_ROWS)
+            for i, code in enumerate(codes)]
+    xs = [x for _, x, _ in keys]
+    ys = [y for _, _, y in keys]
+    cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    hx, hy = (max(xs) - min(xs)) / 2, (max(ys) - min(ys)) / 2
+    polar = {}
+    for code, x, y in keys:
+        dx, dy = (x - cx) / hx, (y - cy) / hy   # tastiera "schiacciata" in un quadrato
+        # per l'intensità le righe pesano la metà: la tastiera ne ha solo 4, e così
+        # anche i tasti centrali della riga dei numeri e di quella in basso restano vivaci
+        polar[code] = (dx, dy, math.hypot(dx, dy * 0.5))
+    r_min = min(r for _, _, r in polar.values())
+    r_max = max(r for _, _, r in polar.values())
+    keymap = {}
+    for code, (dx, dy, r) in polar.items():
+        edge, pos = edge_point(dx, dy)
+        angle = math.degrees(math.atan2(dy, dx)) % 360
+        power = (r_max - r) / (r_max - r_min)   # 1 al centro, 0 sul bordo
+        keymap[code] = (edge, pos, angle, False, round(power, 3))
+    return keymap
+
+
+KEYMAP = build_keymap()
 KEYMAP.update({
-    0x0D: ("T", 0.5, 0.5, True),    # invio: onda dall'alto
-    0x25: ("L", 0.5, 0.5, False),   # freccia sinistra
-    0x26: ("T", 0.5, 0.5, False),   # freccia su
-    0x27: ("R", 0.5, 0.5, False),   # freccia destra
-    0x28: ("B", 0.5, 0.5, False),   # freccia giù
+    0x20: ("B", 0.5, 90, True, "special"),   # spazio: lo special
+    0x0D: ("T", 0.5, 270, True, 1.0),        # invio: onda dall'alto
+    0x25: ("L", 0.5, 180, False, 0.8),       # freccia sinistra
+    0x26: ("T", 0.5, 270, False, 0.8),       # freccia su
+    0x27: ("R", 0.5, 0, False, 0.8),         # freccia destra
+    0x28: ("B", 0.5, 90, False, 0.8),        # freccia giù
 })
 
-VK_F, VK_D, VK_L = 0x46, 0x44, 0x4C
+VK_F, VK_D, VK_L, VK_M = 0x46, 0x44, 0x4C, 0x4D
 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
 WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
 user32 = ctypes.windll.user32 if sys.platform == "win32" else None
@@ -147,6 +219,9 @@ class BeatAnalyzer:
         self.onsets = deque(maxlen=300)   # istanti dei colpi rilevati
         self.last_sound = 0.0
         self.grid = None                  # (periodo, fase, affidabilità)
+        self.loud = deque(maxlen=4000)    # (istante, volume in dB smussato), ~40 secondi
+        self.loud_now = -120.0
+        self.loud_range = None            # (dB "tranquillo", dB "picco") della canzone
 
     def start(self):
         if self.running or not AUDIO_AVAILABLE:
@@ -206,8 +281,16 @@ class BeatAnalyzer:
                 self.ring = x[-self.n:].copy()
             else:
                 self.ring = np.concatenate((self.ring[len(x):], x))
-            if np.sqrt(np.mean(x * x)) > 1e-4:
+            rms = float(np.sqrt(np.mean(x * x)))
+            if rms > 1e-4:
                 self.last_sound = now
+            # inviluppo del volume: sale in fretta (un drop si sente subito) e scende piano,
+            # così segue le sezioni del brano e non il su e giù di ogni singolo colpo
+            db = 20 * math.log10(rms + 1e-9)
+            dt = frame_count / self.sr
+            tau = 0.12 if db > self.loud_now else 1.5
+            self.loud_now += (db - self.loud_now) * (1 - math.exp(-dt / tau))
+            self.loud.append((now, self.loud_now))
             spec = np.log1p(20 * np.abs(np.fft.rfft(self.ring * self.win)))
             if self.prev is not None:
                 rise = np.maximum(spec - self.prev, 0)
@@ -228,12 +311,34 @@ class BeatAnalyzer:
             pass
         return (None, pyaudio.paContinue)
 
+    def energy_at(self, t):
+        """Energia della canzone all'istante t, da 0 (parte più calma) a 1 (picco)."""
+        r = self.loud_range
+        if not (self.running and self.enabled and r) or t - self.last_sound > 1.5:
+            return None
+        db = None
+        for when, value in reversed(self.loud):
+            db = value
+            if when <= t:
+                break
+        if db is None:
+            return None
+        return min(1.0, max(0.0, (db - r[0]) / (r[1] - r[0])))
+
     def update_tempo(self):
-        """Chiamata un paio di volte al secondo: ricalcola BPM e fase."""
+        """Chiamata un paio di volte al secondo: ricalcola BPM, fase e dinamica."""
         if not self.running:
             self.grid = None
+            self.loud_range = None
             return
         now = time.perf_counter()
+        # dinamica: confronta il volume con quello degli ultimi 40 secondi di musica
+        levels = np.array([v for w, v in self.loud if v > -70])
+        if len(levels) > 300:
+            lo, hi = np.percentile(levels, 10), np.percentile(levels, 98)
+            self.loud_range = (float(lo), float(max(hi, lo + 6)))
+        else:
+            self.loud_range = None
         with self.lock:
             recent = [o for o in self.onsets if now - o[0] < 10]
         if len(recent) < 8 or now - self.last_sound > 2:
@@ -269,14 +374,16 @@ class KeyBridge(QObject):
     toggle = Signal()
     cycle_dim = Signal()
     cycle_laser = Signal()
+    cycle_mode = Signal()
 
 
 class HotkeyActions(QObject):
     """Riceve le scorciatoie nel thread principale, dove si può toccare la grafica."""
 
-    def __init__(self, toggle, cycle_dim, cycle_laser):
+    def __init__(self, toggle, cycle_dim, cycle_laser, cycle_mode):
         super().__init__()
         self._toggle, self._dim, self._laser = toggle, cycle_dim, cycle_laser
+        self._mode = cycle_mode
 
     @Slot()
     def toggle(self):
@@ -289,6 +396,10 @@ class HotkeyActions(QObject):
     @Slot()
     def cycle_laser(self):
         self._laser()
+
+    @Slot()
+    def cycle_mode(self):
+        self._mode()
 
 
 class HotkeyThread(threading.Thread):
@@ -382,18 +493,218 @@ class KeyCatcher(QWidget):
 
 
 # ================================================================ overlay
+# Tutto ciò che si disegna è un'immagine preparata UNA volta (sprite). Sulla GPU diventa
+# una texture caricata una volta sola: a ogni fotogramma la scheda video la scala, la ruota
+# e la sfuma da sé, senza che la CPU rigeneri o ricarichi niente.
+_SPRITES = {}
+HUE_STEP = 6                       # sfumature di colore disponibili: 360 / 6 = 60
+GLOW_SATS = (96, 176, 240)         # saturazioni disponibili per gli aloni
 
 
-class Overlay(QWidget):
-    def __init__(self, screen, analyzer):
-        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
-                         Qt.Tool | Qt.WindowTransparentForInput)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setGeometry(screen.geometry())
+def q_hue(hue):
+    return int(round(hue / HUE_STEP)) * HUE_STEP % 360
+
+
+def q_sat(sat, levels=GLOW_SATS):
+    return min(levels, key=lambda v: abs(v - sat))
+
+
+def glow_sprite(hue, sat):
+    """Alone radiale pre-renderizzato."""
+    key = ("glow", q_hue(hue), q_sat(sat))
+    img = _SPRITES.get(key)
+    if img is None:
+        n = SPRITE_SIZE
+        img = QImage(n, n, QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        g = QRadialGradient(QPointF(n / 2, n / 2), n / 2)
+        for stop, alpha in ((0.0, 1.0), (0.35, 0.5), (1.0, 0.0)):
+            c = QColor.fromHsv(key[1], key[2], 255)
+            c.setAlphaF(alpha)
+            g.setColorAt(stop, c)
+        p.setPen(Qt.NoPen)
+        p.setBrush(g)
+        p.drawEllipse(QRectF(0, 0, n, n))
+        p.end()
+        _SPRITES[key] = img
+    return img
+
+
+def beam_sprite(hue, sat):
+    """Sezione di un fascio laser (alone, bagliore, nucleo bianco), pre-renderizzata:
+    per disegnare un laser basta allungarla e ruotarla, in un solo passaggio."""
+    key = ("beam", q_hue(hue), 224)
+    img = _SPRITES.get(key)
+    if img is None:
+        n = 64                       # altezza = larghezza totale del fascio
+        img = QImage(4, n, QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setCompositionMode(QPainter.CompositionMode_Plus)
+        # (frazione della larghezza, opacità, quanto è sbiancato)
+        for frac, alpha, white in ((1.0, 0.10, 0.0), (0.36, 0.30, 0.2), (0.11, 0.95, 0.7)):
+            half = n * frac / 2
+            g = QLinearGradient(0, n / 2 - half, 0, n / 2 + half)
+            c = QColor.fromHsv(key[1], int(key[2] * (1 - white)), 255)
+            c.setAlphaF(alpha)
+            clear = QColor(c)
+            clear.setAlphaF(0)
+            g.setColorAt(0, clear)
+            g.setColorAt(0.25, c)
+            g.setColorAt(0.75, c)
+            g.setColorAt(1, clear)
+            p.fillRect(QRectF(0, n / 2 - half, 4, 2 * half), g)
+        p.end()
+        _SPRITES[key] = img
+    return img
+
+
+def edge_sprite(hue, vertical):
+    """Linea luminosa sul bordo: chiara al centro, sfumata alle estremità."""
+    key = ("edge", q_hue(hue), vertical)
+    img = _SPRITES.get(key)
+    if img is None:
+        n = 64
+        img = QImage(4 if vertical else n, n if vertical else 4,
+                     QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        g = QLinearGradient(0, 0, 0, n) if vertical else QLinearGradient(0, 0, n, 0)
+        hot = QColor.fromHsv(key[1], 80, 255)
+        clear = QColor(hot)
+        clear.setAlphaF(0)
+        g.setColorAt(0, clear)
+        g.setColorAt(0.5, hot)
+        g.setColorAt(1, clear)
+        p.fillRect(img.rect(), g)
+        p.end()
+        _SPRITES[key] = img
+    return img
+
+
+def ring_sprite(hue, white, thickness):
+    """Anello morbido per l'onda d'urto dello special."""
+    key = ("ring", q_hue(hue), white, thickness)
+    img = _SPRITES.get(key)
+    if img is None:
+        n = 256
+        img = QImage(n, n, QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        g = QRadialGradient(QPointF(n / 2, n / 2), n / 2)
+        c = QColor.fromHsv(key[1], int(255 * (1 - white)), 255)
+        clear = QColor(c)
+        clear.setAlphaF(0)
+        g.setColorAt(0, clear)
+        g.setColorAt(max(0.0, 1 - 2 * thickness), clear)
+        g.setColorAt(1 - thickness, c)
+        g.setColorAt(1, clear)
+        p.setPen(Qt.NoPen)
+        p.setBrush(g)
+        p.drawEllipse(QRectF(0, 0, n, n))
+        p.end()
+        _SPRITES[key] = img
+    return img
+
+
+def text_sprite(text, size, weight, spacing=0, color=(255, 255, 255)):
+    """Testo trasformato in immagine, a risoluzione doppia: si può scalare e ruotare
+    senza che i caratteri vengano ri-rasterizzati a ogni fotogramma."""
+    key = ("text", text, size, weight, spacing, color)
+    img = _SPRITES.get(key)
+    if img is None:
+        font = QFont("Segoe UI")
+        font.setPixelSize(size * 2)
+        font.setWeight(weight)
+        if spacing:
+            font.setLetterSpacing(QFont.AbsoluteSpacing, spacing * 2)
+        fm = QFontMetrics(font)
+        w, h = fm.horizontalAdvance(text) + 8, fm.height() + 8
+        img = QImage(max(w, 1), max(h, 1), QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setFont(font)
+        p.setPen(QColor(*color))
+        p.drawText(QRectF(0, 0, w, h), Qt.AlignCenter, text)
+        p.end()
+        _SPRITES[key] = img
+    return img
+
+
+SCORE_SIZE, SCORE_WEIGHT = 118, QFont.Black
+COMMENT_SIZE, COMMENT_WEIGHT = 54, QFont.Bold
+
+
+def all_sprites():
+    """Tutti gli sprite usati durante una sessione, per caricarli sulla GPU all'avvio."""
+    for h in range(0, 360, HUE_STEP):
+        for sat in GLOW_SATS:
+            yield glow_sprite(h, sat)
+        yield beam_sprite(h, 224)
+        yield edge_sprite(h, True)
+        yield edge_sprite(h, False)
+    for pal in PALETTES.values():   # lo special usa solo il colore inferiore della palette
+        yield ring_sprite(pal["B"][0], 0.0, 0.10)
+        yield ring_sprite(pal["B"][0], 0.6, 0.03)
+    yield shade_sprite()
+    for ch in "0123456789,":
+        yield text_sprite(ch, SCORE_SIZE, SCORE_WEIGHT)
+    for _, label, color, _, _ in JUDGEMENTS:
+        yield text_sprite(label, LABEL_SIZE, QFont.Bold, 5, color)
+    for label, color in EXTRA_LABELS:
+        yield text_sprite(label, LABEL_SIZE, QFont.Bold, 5, color)
+
+
+def ray_exit(x0, y0, dx, dy, W, H):
+    """Distanza a cui un raggio che parte da (x0, y0) esce dallo schermo."""
+    t = 1e9
+    if dx > 1e-9:
+        t = min(t, (W - x0) / dx)
+    elif dx < -1e-9:
+        t = min(t, -x0 / dx)
+    if dy > 1e-9:
+        t = min(t, (H - y0) / dy)
+    elif dy < -1e-9:
+        t = min(t, -y0 / dy)
+    return max(0.0, t)
+
+
+def shade_sprite():
+    """Alone scuro pre-renderizzato, per far leggere il testo della schermata finale."""
+    img = _SPRITES.get("shade")
+    if img is None:
+        n = SPRITE_SIZE
+        img = QImage(n, n, QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        g = QRadialGradient(QPointF(n / 2, n / 2), n / 2)
+        g.setColorAt(0, QColor(0, 0, 0, 150))
+        g.setColorAt(1, QColor(0, 0, 0, 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(g)
+        p.drawEllipse(QRectF(0, 0, n, n))
+        p.end()
+        _SPRITES["shade"] = img
+    return img
+
+
+
+class OverlayBase:
+    """Logica ed effetti dell'overlay. Le due classi sotto decidono solo DOVE si disegna:
+    GpuOverlay su una superficie OpenGL (scheda video), CpuOverlay su una finestra normale."""
+
+    def full_rect(self):
+        return QRect(0, 0, self.width(), self.height())
+
+    def _setup(self, analyzer):
         self.analyzer = analyzer
         self.flashes = []
         self.lasers = []
+        self.specials = []
         self.palette_name = "Neon"
         self.laser_mode = "Con i flash"
         self.dim_name = "Medio"
@@ -407,13 +718,64 @@ class Overlay(QWidget):
         self.reset_calibration()
         self.reset_session()
         self.last_paint = time.perf_counter()
+        self.prev_region = QRegion()
+        self.paint_ms = 0.0
+        self.font_hud = QFont("Consolas", 9)
+        self.font_detail = QFont("Consolas", 10)
+        self.font_stats = QFont("Consolas", 12)
+        self.font_best = QFont("Segoe UI", 14, QFont.Bold)
+        self.font_best.setLetterSpacing(QFont.AbsoluteSpacing, 5)
+        self.font_judge = QFont("Segoe UI", 24, QFont.Bold)
+        self.font_judge.setLetterSpacing(QFont.AbsoluteSpacing, 4)
+        self.font_judge_big = QFont("Segoe UI", 38, QFont.Black)
+        self.font_judge_big.setLetterSpacing(QFont.AbsoluteSpacing, 6)
+        self.prewarm = False   # la versione GPU carica tutti gli sprite al primo fotogramma
+        self.mode = "Quiet"
+        self.frame_dt = 0.016
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update)
-        self.timer.start(16)
+        self.timer.timeout.connect(self._tick)
+
+    # ------------------------------------------------------------ fotogrammi
+    def _wake(self):
+        """Riparte con l'animazione (il timer si ferma da solo quando non serve)."""
+        if not self.timer.isActive():
+            self.last_paint = time.perf_counter()
+            self.timer.start(FRAME_MS)
+
+    def _dim_target(self):
+        return DIM_LEVELS[self.dim_name] if (self.armed or self.summary) else 0.0
+
+    def _tick(self):
+        """Ridisegna solo i rettangoli dove c'è qualcosa che cambia."""
+        now = time.perf_counter()
+        W, H = self.width(), self.height()
+        full = self.full_rect()
+        dim_moving = abs(self.dim_now - self._dim_target()) > 1e-3
+        if dim_moving or self.summary or self.specials:
+            region = QRegion(full)   # effetti che coprono tutto lo schermo
+        else:
+            region = QRegion()
+            for f in self.flashes:
+                region = region.united(f["rect"])
+            for l in self.lasers:
+                region = region.united(l["rect"])
+            if self.armed and self.mode == "Loud":
+                region = region.united(QRect(0, 0, 340, 150))         # analisi a sinistra
+                region = region.united(QRect(W // 2 - 600, H // 2 - 560, 1200, 960))
+            elif self.armed:
+                region = region.united(QRect(W - 340, 0, 340, 150))  # HUD in alto a destra
+                if self.judgement and now - self.judgement["t0"] < 1.0:
+                    region = region.united(QRect(0, 20, W, 120))  # giudizio in alto
+        dirty = region.united(self.prev_region)   # anche dove c'era qualcosa da cancellare
+        self.prev_region = region
+        if not dirty.isEmpty():
+            self.update(dirty)
+        elif not self.armed:
+            self.timer.stop()  # niente da mostrare: zero lavoro finché non serve
 
     def reset_calibration(self):
         self.latency = deque(maxlen=24)   # scarti grezzi, per stimare la latenza cuffie
-        self.judgement = None             # (scritta, colore, ms, levare, t0, punti)
+        self.judgement = None             # dict con scritta, colore, dettagli e istante
 
     def reset_session(self):
         self.results = deque(maxlen=32)   # precisione degli ultimi tap, per l'HUD
@@ -423,6 +785,14 @@ class Overlay(QWidget):
         self.judged = 0                   # tap giudicati sul ritmo
         self.precision = 0.0              # somma dei pesi dei giudizi
         self.tap_count = 0
+        self.energy_judged = 0            # tap giudicati sull'energia
+        self.energy_score = 0.0           # 1 = luce adatta, 0.5 = neutra, 0 = sbagliata
+        self.drops = 0
+        self.last_special = 0.0
+        self.feed = []                    # colonna dei giudizi (modalità Loud)
+        self.shown_score = 0.0            # punteggio mostrato, che "conta" verso quello vero
+        self.score_bump = 0.0             # istante dell'ultimo punto preso, per il colpo di zoom
+        self.last_power = None            # (intensità dell'ultimo tasto, istante)
 
     def latency_estimate(self, P):
         """Latenza cuffie stimata dai tap (media circolare: non salta tra battere e levare)."""
@@ -437,22 +807,82 @@ class Overlay(QWidget):
         return 1 + min(self.combo // 10, 3)  # x1, poi x2 a combo 10, fino a x4
 
     # ------------------------------------------------------------ eventi
-    def fire(self, edge, pos, hue_t, big, t_key):
+    def fire(self, edge, pos, angle, big, power, t_key):
         if not self.armed:
             return
-        label = self._judge(t_key)
-        boost = label == "PERFECT"
-        if label in (None, "CALIBRATING"):
-            self.score += FREESTYLE_POINTS
+        now = time.perf_counter()
+        tier = "special" if power == "special" else "light"
+        if tier == "special":
+            if now - self.last_special < SPECIAL_COOLDOWN:
+                return
+            self.last_special = now
+
+        timing = self._judge_timing(t_key)
+        note, factor = self._judge_energy(power, t_key)
+        mult = self.multiplier
+
+        # punti: precisione sul tempo x adattezza della luce al momento x combo
+        judged = timing is not None and timing["label"] != "CALIBRATING"
+        base = timing["points"] if judged else FREESTYLE_POINTS
+        bonus = DROP_BONUS if (tier == "special" and factor >= ENERGY_MATCH) else 0
+        points = round((base * factor + bonus) * mult)
+        self.score += points
+
+        if judged:
+            self.combo = self.combo + 1 if timing["label"] in ("PERFECT", "GREAT") else 0
+        if tier == "special" and note == "SAVE IT!":
+            self.combo = 0  # special sprecato in un momento calmo
+        self.max_combo = max(self.max_combo, self.combo)
         self.tap_count += 1
-        if self.laser_mode != "Solo laser":
-            self._add(edge, pos, hue_t, big, boost)
-        if self.laser_mode != "Spenti":
-            self._add_laser(edge, pos, hue_t, big, boost)
+
+        # cosa scrivere in alto al centro
+        if tier == "special" and note in ("DROP!", "SAVE IT!"):
+            color = (255, 90, 210) if note == "DROP!" else (255, 150, 80)
+            self.judgement = dict(label=note, color=color, big=True, t0=now,
+                                  detail=self._detail(timing, None, points))
+        elif timing is not None:
+            self.judgement = dict(label=timing["label"], color=timing["color"], big=False,
+                                  t0=now, detail=self._detail(timing, note, points))
+
+        if points:
+            self.score_bump = now
+        if self.judgement and self.judgement["t0"] == now:   # nuovo giudizio in colonna
+            self.feed.insert(0, dict(label=self.judgement["label"],
+                                     color=self.judgement["color"], t0=now, y=None,
+                                     points=points, note=note or ""))
+            del self.feed[FEED_LENGTH:]
+
+        boost = judged and timing["label"] == "PERFECT"
+        if tier == "special":
+            self._add_special(boost)
+        else:
+            self.last_power = (power, now)
+            hue = self._angle_hue(angle)
+            lasers = self.laser_mode != "Spenti" and power >= LASER_MIN_POWER
+            if not (lasers and self.laser_mode == "Solo laser"):
+                self._add(edge, pos, 0.5, big, boost, power=power, hue=hue)
+            if lasers:
+                self._add_laser(edge, pos, 0.5, big, boost, power=power, hue=hue)
         self._tap()
 
-    def _judge(self, t):
-        """Confronta il tap con il ritmo della canzone. Ritorna il giudizio o None."""
+    @staticmethod
+    def _detail(timing, note, points):
+        parts = []
+        if timing is None or timing["label"] == "CALIBRATING":
+            if timing is not None:
+                parts.append("tap along to the beat")
+        else:
+            parts.append(f"{timing['ms']:+.0f} ms")
+            if timing["offbeat"]:
+                parts.append("off-beat")
+        if note:
+            parts.append(note)
+        if points:
+            parts.append(f"+{points:,}")
+        return "  ·  ".join(parts)
+
+    def _judge_timing(self, t):
+        """Confronta il tap con il ritmo della canzone. Ritorna un dict o None."""
         a = self.analyzer
         if not (a.running and a.enabled):
             return None
@@ -465,9 +895,7 @@ class Overlay(QWidget):
         self.latency.append(raw)
         lat = self.latency_estimate(P)
         if lat is None:  # primi tap: misura la latenza delle cuffie, senza giudicare
-            self.judgement = ("CALIBRATING", (180, 176, 200), None, False,
-                              time.perf_counter(), 0)
-            return "CALIBRATING"
+            return dict(label="CALIBRATING", color=(180, 176, 200))
         x = ((raw - lat + half) % P) - half     # rispetto al battere, latenza tolta
         offbeat = abs(x) > P / 4
         err = x - math.copysign(half, x) if offbeat else x
@@ -475,38 +903,149 @@ class Overlay(QWidget):
         for limit, label, color, points, weight in JUDGEMENTS:
             if abs(ms) <= limit:
                 break
-        good = label in ("PERFECT", "GREAT")
-        points *= self.multiplier
-        self.score += points
-        self.combo = self.combo + 1 if good else 0
-        self.max_combo = max(self.max_combo, self.combo)
         self.judged += 1
         self.precision += weight
         self.results.append(weight)
-        self.judgement = (label, color, ms, offbeat, time.perf_counter(), points)
-        return label
+        return dict(label=label, color=color, ms=ms, offbeat=offbeat, points=points)
+
+    def _judge_energy(self, power, t):
+        """Quanto l'intensità della luce è adatta al momento: (nota, moltiplicatore)."""
+        a = self.analyzer
+        lat = (self.latency_estimate(a.grid[0]) if a.grid else None) or 0.0
+        level = a.energy_at(t - lat)  # la musica che senti ora è uscita dal PC "lat" fa
+        if level is None:
+            return None, 1.0
+        if power == "special":
+            # l'audio arriva al PC prima che alle tue orecchie: guarda anche quello più recente
+            latest = a.energy_at(time.perf_counter())
+            if latest is not None:
+                level = max(level, latest)
+            before = a.energy_at(t - lat - 1.0)
+            rising = before is not None and level - before >= ENERGY_RISE
+            if level >= ENERGY_PEAK or (level >= 0.65 and rising):
+                note, factor, score = "DROP!", ENERGY_MATCH, 1.0
+                self.drops += 1
+            else:
+                note, factor, score = "SAVE IT!", 0.0, 0.0
+        else:
+            diff = power - level
+            if abs(diff) <= ENERGY_TOLERANCE:
+                note, factor = "vibe ✓", ENERGY_MATCH
+            elif diff < -ENERGY_OFF:
+                note, factor = "go bigger!", ENERGY_MISMATCH
+            elif diff > ENERGY_OFF:
+                note, factor = "too much!", ENERGY_MISMATCH
+            else:
+                note, factor = "", 1.0
+            score = max(0.0, 1 - abs(diff) / ENERGY_OFF)
+        self.energy_judged += 1
+        self.energy_score += score
+        return note, factor
+
+    def _angle_hue(self, angle):
+        """Colore che sfuma girando attorno allo schermo, tra i colori dei quattro bordi."""
+        pal = PALETTES[self.palette_name]
+        order = ["R", "B", "L", "T"]   # 0°, 90°, 180°, 270° (y verso il basso)
+        a = angle % 360
+        i = int(a // 90)
+        f = (a % 90) / 90
+        h1 = sum(pal[order[i]]) / 2
+        h2 = sum(pal[order[(i + 1) % 4]]) / 2
+        d = ((h2 - h1 + 540) % 360) - 180   # via più breve sul cerchio dei colori
+        return (h1 + d * f + random.uniform(-4, 4)) % 360
 
     def _palette_hue(self, edge, hue_t):
         p = PALETTES[self.palette_name]
         h0, h1 = p[edge]
         return (h0 + (h1 - h0) * hue_t + random.uniform(-4, 4)) % 360, p
 
-    def _add(self, edge, pos, hue_t, big, boost=False):
-        hue, p = self._palette_hue(edge, hue_t)
-        self.flashes.append(dict(edge=edge, pos=pos, hue=hue, sat=p["sat"], val=p["val"],
-                                 t0=time.perf_counter(), big=big, boost=boost))
-        del self.flashes[:-120]
+    def _add(self, edge, pos, hue_t, big, boost=False, power=1.0, hue=None):
+        h, p = self._palette_hue(edge, hue_t)
+        life = SOFT_LIFE + (LIFE - SOFT_LIFE) * power   # più morbida = più lunga
+        f = dict(edge=edge, pos=pos, hue=h if hue is None else hue, sat=p["sat"],
+                 val=p["val"], t0=time.perf_counter(), big=big, boost=boost, power=power,
+                 life=life)
+        W, H = self.width(), self.height()
+        span, depth, _, _ = self._flash_shape(f, W, H)
+        x, y = self._anchor(edge, pos, W, H)
+        # ingombro massimo durante tutta la vita della luce: solo lì si ridisegna
+        along, across = 0.55 * span, 0.64 * depth
+        rx, ry = (across, along) if edge in "LR" else (along, across)
+        f["rect"] = QRectF(x - rx, y - ry, 2 * rx, 2 * ry).toAlignedRect() \
+            .adjusted(-2, -2, 2, 2).intersected(self.full_rect())
+        self.flashes.append(f)
+        del self.flashes[:-MAX_FLASHES]
+        self._wake()
 
-    def _add_laser(self, edge, pos, hue_t, big, boost=False):
-        hue, p = self._palette_hue(edge, hue_t)
+    @staticmethod
+    def _flash_shape(f, W, H):
+        """Dimensioni di base, luminosità e saturazione di una luce."""
+        pw = f["power"]
+        soft = 1 - pw
+        vertical = f["edge"] in "LR"
+        S = min(W, H)
+        if f["big"]:
+            span = (H if vertical else W) * 0.95
+            depth = S * 0.55
+        else:
+            # forti: strette e intense. Morbide: ampie e diffuse.
+            span = (H * (0.5 + 0.25 * soft)) if vertical else (W * (0.26 + 0.14 * soft))
+            depth = S * (0.36 + 0.14 * soft)
+        peak = 0.42 + 0.53 * pw
+        if f["boost"]:  # tap perfetto: luce più grande e più luminosa
+            span *= 1.2
+            depth *= 1.25
+            peak = min(1.0, peak + 0.1)
+        sat = int(f["sat"] * (0.65 + 0.35 * pw))
+        return span, depth, peak, sat
+
+    def _add_special(self, boost):
+        """Barra spaziatrice: lampo, onda d'urto dal centro, luce e laser da ogni bordo."""
+        hue = PALETTES[self.palette_name]["B"][0]
+        self.specials.append(dict(t0=time.perf_counter(), hue=hue, boost=boost))
+        del self.specials[:-3]
+        self._wake()
+        for edge in "LRTB":
+            if self.laser_mode != "Solo laser":
+                self._add(edge, 0.5, 0.5, True, True)
+            if self.laser_mode != "Spenti":
+                self._add_laser(edge, 0.5, 0.5, True, True)
+
+    def _add_laser(self, edge, pos, hue_t, big, boost=False, power=1.0, hue=None):
+        h, p = self._palette_hue(edge, hue_t)
+        hue = h if hue is None else hue
         if big:
             # ventaglio di fasci che si aprono a forbice
             beams = [(-55 + i * 110 / 6, 18 if i % 2 else -18) for i in range(7)]
         else:
             beams = [(None, random.choice((-1, 1)) * random.uniform(7, 13))]
-        self.lasers.append(dict(edge=edge, pos=0.5 if big else pos, hue=hue, sat=p["sat"],
-                                beams=beams, t0=time.perf_counter(), boost=boost))
-        del self.lasers[:-60]
+        l = dict(edge=edge, pos=0.5 if big else pos, hue=hue, sat=p["sat"],
+                 t0=time.perf_counter(), boost=boost, power=power)
+        W, H = self.width(), self.height()
+        x0, y0 = self._anchor(edge, l["pos"], W, H)
+        # direzione verso il lato opposto, in posizione speculare: i fasci si incrociano
+        tx, ty = {"L": (W, (1 - pos) * H), "R": (0, (1 - pos) * H),
+                  "T": ((1 - pos) * W, H), "B": ((1 - pos) * W, 0)}[edge]
+        base = math.degrees(math.atan2(ty - y0, tx - x0))
+        normal = {"L": 0, "R": 180, "T": 90, "B": -90}[edge]
+        l["origin"] = (x0, y0)
+        l["beams"] = [((normal + spread) if spread is not None else base, sweep)
+                      for spread, sweep in beams]
+        # area occupata durante tutta la vita del laser (solo lì si ridisegna)
+        xs, ys = [x0], [y0]
+        for start, sweep in l["beams"]:
+            for kk in (0.0, 0.5, 1.0):
+                rad = math.radians(start + sweep * kk)
+                dx, dy = math.cos(rad), math.sin(rad)
+                t = ray_exit(x0, y0, dx, dy, W, H)
+                xs.append(x0 + dx * t)
+                ys.append(y0 + dy * t)
+        pad = 50
+        l["rect"] = QRectF(min(xs) - pad, min(ys) - pad, max(xs) - min(xs) + 2 * pad,
+                           max(ys) - min(ys) + 2 * pad).toAlignedRect().intersected(self.full_rect())
+        self.lasers.append(l)
+        del self.lasers[:-MAX_LASERS]
+        self._wake()
 
     def _tap(self):
         now = time.perf_counter()
@@ -525,6 +1064,7 @@ class Overlay(QWidget):
 
     def set_armed(self, on):
         self.armed = on
+        self._wake()
         self.taps.clear()
         self.bpm = None
         self.judgement = None
@@ -543,9 +1083,15 @@ class Overlay(QWidget):
         """Fine sessione: commento, punteggio e un'ultima esplosione di luce."""
         if self.judged >= 8:
             acc = self.precision / self.judged
+            stats = f"max combo {self.max_combo}  ·  {round(acc * 100)}% timing"
+            if self.energy_judged >= 8:
+                vibe = self.energy_score / self.energy_judged
+                acc = 0.75 * acc + 0.25 * vibe  # il tempo conta di più, l'energia aiuta
+                stats += f"  ·  {round(vibe * 100)}% vibe"
+            if self.drops:
+                stats += f"  ·  {self.drops} drop" + ("s" if self.drops > 1 else "")
+            stats += f"  ·  {self.tap_count} taps"
             tier = 3 if acc >= 0.9 else 2 if acc >= 0.76 else 1 if acc >= 0.63 else 0
-            stats = (f"max combo {self.max_combo}  ·  {round(acc * 100)}% accuracy"
-                     f"  ·  {self.tap_count} taps")
         else:  # niente analisi: conta l'impegno
             n = self.tap_count
             tier = 3 if n >= 150 else 2 if n >= 60 else 1 if n >= 20 else 0
@@ -554,9 +1100,10 @@ class Overlay(QWidget):
         if new_best:
             self.best = self.score
             self.on_best(self.score)
+        accent = QColor.fromHsv(int(PALETTES[self.palette_name]["L"][0]), 150, 255)
         self.summary = dict(t0=time.perf_counter(), comment=random.choice(COMMENTS[tier]),
                             score=self.score, stats=stats, new_best=new_best,
-                            hue=PALETTES[self.palette_name]["L"][0])
+                            accent=(accent.red(), accent.green(), accent.blue()))
         for edge in "LRTB":
             if self.laser_mode != "Solo laser":
                 self._add(edge, 0.5, 0.5, True, True)
@@ -574,19 +1121,29 @@ class Overlay(QWidget):
             return pos * W, 0.0
         return pos * W, float(H)
 
-    def paintEvent(self, _):
+    def _render(self, p, area):
+        started = time.perf_counter()
         W, H = self.width(), self.height()
-        p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        if self.prewarm:
+            # primo fotogramma sulla GPU: carica ora tutte le texture, una volta per tutte,
+            # disegnandole in un pixel quasi trasparente (poi viene ripulito qui sotto)
+            p.setOpacity(1 / 255)
+            for img in all_sprites():
+                p.drawImage(QRectF(0, 0, 1, 1), img)
+            p.setOpacity(1.0)
+            self.prewarm = False
         p.setCompositionMode(QPainter.CompositionMode_Source)
-        p.fillRect(self.rect(), Qt.transparent)
+        p.fillRect(area, Qt.transparent)
 
         now = time.perf_counter()
-        dt = now - self.last_paint
+        dt = min(now - self.last_paint, 0.1)
         self.last_paint = now
+        self.frame_dt = dt
 
         # velo scuro: entra e esce con una dissolvenza quando accendi/spegni
-        target = DIM_LEVELS[self.dim_name] if (self.armed or self.summary) else 0.0
+        target = self._dim_target()
         step = dt / DIM_FADE
         if self.dim_now < target:
             self.dim_now = min(target, self.dim_now + step)
@@ -596,18 +1153,25 @@ class Overlay(QWidget):
             p.setCompositionMode(QPainter.CompositionMode_SourceOver)
             veil = QColor(*DIM_TINT)
             veil.setAlphaF(self.dim_now)
-            p.fillRect(self.rect(), veil)
+            p.fillRect(area, veil)
 
         p.setCompositionMode(QPainter.CompositionMode_Plus)
-        self._draw_flashes(p, W, H, now)
-        self._draw_lasers(p, W, H, now)
+        self._draw_specials(p, W, H, now)
+        self._draw_flashes(p, W, H, now, area)
+        self._draw_lasers(p, W, H, now, area)
+        p.setOpacity(1.0)
 
         p.setCompositionMode(QPainter.CompositionMode_SourceOver)
         if self.armed:
+            if self.mode == "Loud":
+                self._draw_loud(p, W, H, now)
             self._draw_hud(p, W, H, now)
         if self.summary:
             self._draw_summary(p, W, H, now)
         p.end()
+        # tempo di disegno medio, mostrato nell'HUD per capire quanto pesa
+        ms = (time.perf_counter() - started) * 1000
+        self.paint_ms += (ms - self.paint_ms) * 0.1
 
     def _draw_summary(self, p, W, H, now):
         s = self.summary
@@ -626,35 +1190,33 @@ class Overlay(QWidget):
         tilt = 3 * math.sin(2 * math.pi * 0.8 * t)
 
         # alone scuro dietro al testo per farlo leggere su qualsiasi sfondo
-        g = QRadialGradient(QPointF(W / 2, H / 2), min(W, H) * 0.45)
-        g.setColorAt(0, QColor(0, 0, 0, int(150 * alpha)))
-        g.setColorAt(1, QColor(0, 0, 0, 0))
-        p.setPen(Qt.NoPen)
-        p.setBrush(g)
-        p.drawRect(QRectF(0, 0, W, H))
+        r = min(W, H) * 0.45
+        p.setOpacity(alpha)
+        p.drawImage(QRectF(W / 2 - r, H / 2 - r, 2 * r, 2 * r), shade_sprite())
+        p.setOpacity(1.0)
 
         shown = int(s["score"] * min(t / 0.8, 1) ** 0.5)   # il punteggio "conta" da zero
-        accent = QColor.fromHsv(int(s["hue"]), 150, 255)
-        accent.setAlphaF(alpha)
-        white = QColor(255, 255, 255)
-        white.setAlphaF(alpha)
 
+        # commento e cifre sono immagini già pronte: la GPU le scala e le ruota da sé
         p.save()
         p.translate(W / 2, H / 2)
         p.rotate(tilt)
         p.scale(scale, scale)
-        f = QFont("Segoe UI", 40, QFont.Bold)
-        f.setLetterSpacing(QFont.AbsoluteSpacing, 6)
-        p.setFont(f)
-        p.setPen(accent)
-        p.drawText(QRectF(-W, -120, 2 * W, 70), Qt.AlignCenter, s["comment"])
-        f = QFont("Segoe UI", 88, QFont.Black)
-        p.setFont(f)
-        p.setPen(white)
-        p.drawText(QRectF(-W, -55, 2 * W, 130), Qt.AlignCenter, f"{shown:,}")
+        p.setOpacity(alpha)
+        img = text_sprite(s["comment"], COMMENT_SIZE, COMMENT_WEIGHT, 6, s["accent"])
+        w, h = img.width() / 2, img.height() / 2
+        p.drawImage(QRectF(-w / 2, -85 - h / 2, w, h), img)
+        digits = [text_sprite(ch, SCORE_SIZE, SCORE_WEIGHT) for ch in f"{shown:,}"]
+        total = sum(d.width() for d in digits) / 2
+        x = -total / 2
+        for d in digits:
+            w, h = d.width() / 2, d.height() / 2
+            p.drawImage(QRectF(x, 10 - h / 2, w, h), d)
+            x += w
         p.restore()
+        p.setOpacity(1.0)
 
-        p.setFont(QFont("Consolas", 12))
+        p.setFont(self.font_stats)
         dim = QColor(255, 255, 255)
         dim.setAlphaF(0.7 * alpha)
         p.setPen(dim)
@@ -662,138 +1224,132 @@ class Overlay(QWidget):
         if s["new_best"] and s["score"] > 0:
             gold = QColor(255, 210, 90)
             gold.setAlphaF(alpha * (0.6 + 0.4 * math.sin(now * 10)))
-            f = QFont("Segoe UI", 14, QFont.Bold)
-            f.setLetterSpacing(QFont.AbsoluteSpacing, 5)
-            p.setFont(f)
+            p.setFont(self.font_best)
             p.setPen(gold)
             p.drawText(QRectF(0, H / 2 + 125, W, 28), Qt.AlignCenter, "NEW BEST!")
 
-    def _draw_flashes(self, p, W, H, now):
-        S = min(W, H)
-        self.flashes = [f for f in self.flashes if now - f["t0"] < LIFE]
+    def _draw_specials(self, p, W, H, now):
+        cx, cy = W / 2, H / 2
+        diag = math.hypot(W, H)
+        self.specials = [s for s in self.specials if now - s["t0"] < SPECIAL_LIFE]
+        for s in self.specials:
+            t = now - s["t0"]
+            k = t / SPECIAL_LIFE
+            hue = int(s["hue"])
+            # lampo su tutto lo schermo, brevissimo
+            if t < 0.3:
+                wash = QColor.fromHsv(hue, 90, 255)
+                wash.setAlphaF(0.3 * (1 - t / 0.3) ** 2)
+                p.fillRect(QRectF(0, 0, W, H), wash)
+            # due onde d'urto ad anello che partono dal centro
+            for delay, white, thickness in ((0.0, 0.0, 0.10), (0.09, 0.6, 0.03)):
+                kk = (t - delay) / (SPECIAL_LIFE - delay)
+                if not 0 <= kk < 1:
+                    continue
+                r = diag * 0.62 * (1 - (1 - kk) ** 3)
+                p.setOpacity(0.75 * (1 - kk) ** 1.4)
+                p.drawImage(QRectF(cx - r, cy - r, 2 * r, 2 * r),
+                            ring_sprite(hue, white, thickness))
+            p.setOpacity(1.0)
+            # bagliore al centro
+            r = diag * 0.25
+            p.setOpacity(0.35 * (1 - k) ** 2)
+            p.drawImage(QRectF(cx - r, cy - r, 2 * r, 2 * r), glow_sprite(hue, 120))
+            p.setOpacity(1.0)
+
+    def _draw_flashes(self, p, W, H, now, area):
+        self.flashes = [f for f in self.flashes if now - f["t0"] < f["life"]]
         for f in self.flashes:
-            k = (now - f["t0"]) / LIFE
-            a = (1 - k) ** 2.2
-            grow = 1 - (1 - k) ** 3
+            if not f["rect"].intersects(area):
+                continue
+            age = now - f["t0"]
+            k = age / f["life"]
+            pw = f["power"]          # 0 = morbida e lenta, 1 = forte e secca
+            soft = 1 - pw
             edge = f["edge"]
             vertical = edge in "LR"
             x, y = self._anchor(edge, f["pos"], W, H)
-            if f["big"]:
-                span = (H if vertical else W) * 0.95
-                depth = S * 0.55
+            # le luci morbide salgono piano invece di accendersi di colpo
+            attack = SOFT_ATTACK * soft
+            if attack > 0.01 and age < attack:
+                a = (age / attack) ** 0.7
             else:
-                span = (H * 0.5) if vertical else (W * 0.26)
-                depth = S * 0.36
-            if f["boost"]:  # tap perfetto: flash più grande e più luminoso
-                span *= 1.2
-                depth *= 1.25
+                rest = (age - attack) / (f["life"] - attack)
+                a = (1 - rest) ** (2.2 - 0.6 * soft)
+            grow = 1 - (1 - k) ** (3 - soft)
+            span, depth, peak, sat = self._flash_shape(f, W, H)
             depth *= 0.55 + grow * 0.6
-            peak = 1.0 if f["boost"] else 0.85
 
-            def col(alpha):
-                c = QColor.fromHsv(int(f["hue"]), f["sat"], f["val"])
-                c.setAlphaF(max(0.0, min(1.0, alpha)))
-                return c
-
-            p.save()
-            p.translate(x, y)
-            if vertical:
-                p.scale(depth / span, 1)
-            else:
-                p.scale(1, depth / span)
+            # alone: uno sprite già pronto, schiacciato contro il bordo e scalato
             r = span * 0.5 * (0.7 + grow * 0.4)
-            g = QRadialGradient(QPointF(0, 0), r)
-            g.setColorAt(0, col(peak * a))
-            g.setColorAt(0.35, col(0.45 * a))
-            g.setColorAt(1, col(0))
-            p.setPen(Qt.NoPen)
-            p.setBrush(g)
-            p.drawEllipse(QPointF(0, 0), r, r)
-            p.restore()
+            across = r * depth / span
+            rx, ry = (across, r) if vertical else (r, across)
+            p.setOpacity(max(0.0, min(1.0, peak * a)))
+            p.drawImage(QRectF(x - rx, y - ry, 2 * rx, 2 * ry), glow_sprite(f["hue"], sat))
+            p.setOpacity(1.0)
 
+            edge_line = min(1.0, max(0.0, (pw - 0.3) / 0.4))
+            if edge_line <= 0:
+                continue  # le luci morbide sono solo alone, senza linea dura sul bordo
             length = span * (0.35 + grow * 0.5)
-            th = 4 + 8 * a
-            hot = QColor.fromHsv(int(f["hue"]), int(f["sat"] * 0.35), 255)
+            th = (4 + 8 * a) * (0.5 + 0.5 * edge_line)
             if vertical:
-                lg = QLinearGradient(0, y - length / 2, 0, y + length / 2)
                 rect = QRectF(0 if edge == "L" else W - th, y - length / 2, th, length)
             else:
-                lg = QLinearGradient(x - length / 2, 0, x + length / 2, 0)
                 rect = QRectF(x - length / 2, 0 if edge == "T" else H - th, length, th)
-            hot.setAlphaF(a)
-            clear = QColor(hot)
-            clear.setAlphaF(0)
-            lg.setColorAt(0, clear)
-            lg.setColorAt(0.5, hot)
-            lg.setColorAt(1, clear)
-            p.fillRect(rect, lg)
+            p.setOpacity(max(0.0, min(1.0, a * edge_line)))
+            p.drawImage(rect, edge_sprite(f["hue"], vertical))
+            p.setOpacity(1.0)
 
-    def _draw_lasers(self, p, W, H, now):
-        reach = math.hypot(W, H) * 1.1
+    def _draw_lasers(self, p, W, H, now, area):
         self.lasers = [l for l in self.lasers if now - l["t0"] < LASER_LIFE]
         for l in self.lasers:
+            if not l["rect"].intersects(area):
+                continue
             k = (now - l["t0"]) / LASER_LIFE
-            a = (1 - k) ** 1.6
-            edge, pos = l["edge"], l["pos"]
-            x0, y0 = self._anchor(edge, pos, W, H)
-            # direzione verso il lato opposto, in posizione speculare: i fasci si incrociano
-            if edge == "L":
-                tx, ty = W, (1 - pos) * H
-            elif edge == "R":
-                tx, ty = 0, (1 - pos) * H
-            elif edge == "T":
-                tx, ty = (1 - pos) * W, H
-            else:
-                tx, ty = (1 - pos) * W, 0
-            base = math.degrees(math.atan2(ty - y0, tx - x0))
-            normal = {"L": 0, "R": 180, "T": 90, "B": -90}[edge]
-            widths = (22, 8, 2.4) if l["boost"] else (16, 6, 2.0)
-            for spread, sweep in l["beams"]:
-                ang = (normal + spread if spread is not None else base) + sweep * k
+            a = (1 - k) ** 1.6 * (0.55 + 0.45 * l["power"])
+            x0, y0 = l["origin"]
+            width = 22 if l["boost"] else 16
+            sprite = beam_sprite(l["hue"], l["sat"])
+            p.setOpacity(min(1.0, a))
+            for start, sweep in l["beams"]:
+                ang = start + sweep * k
                 rad = math.radians(ang)
-                x1, y1 = x0 + math.cos(rad) * reach, y0 + math.sin(rad) * reach
-                for width, alpha, white in ((widths[0], 0.10, 0.0),
-                                            (widths[1], 0.30, 0.2),
-                                            (widths[2], 0.95, 0.7)):
-                    c = QColor.fromHsv(int(l["hue"]), int(l["sat"] * (1 - white)), 255)
-                    c.setAlphaF(alpha * a)
-                    pen = QPen(c, width)
-                    pen.setCapStyle(Qt.RoundCap)
-                    p.setPen(pen)
-                    p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+                length = ray_exit(x0, y0, math.cos(rad), math.sin(rad), W, H) + width
+                p.save()
+                p.translate(x0, y0)
+                p.rotate(ang)
+                p.drawImage(QRectF(0, -width / 2, length, width), sprite)
+                p.restore()
             # bagliore sulla sorgente
-            g = QRadialGradient(QPointF(x0, y0), 40)
-            c = QColor.fromHsv(int(l["hue"]), int(l["sat"] * 0.4), 255)
-            c.setAlphaF(0.8 * a)
-            g.setColorAt(0, c)
-            c2 = QColor(c)
-            c2.setAlphaF(0)
-            g.setColorAt(1, c2)
-            p.setPen(Qt.NoPen)
-            p.setBrush(g)
-            p.drawEllipse(QPointF(x0, y0), 40, 40)
+            p.setOpacity(min(1.0, 0.8 * a))
+            p.drawImage(QRectF(x0 - 40, y0 - 40, 80, 80),
+                        glow_sprite(l["hue"], l["sat"] * 0.4))
+            p.setOpacity(1.0)
 
     def _draw_hud(self, p, W, H, now):
         a = self.analyzer
         lat = (self.latency_estimate(a.grid[0]) if a.grid else None) or 0.0
+        loud = self.mode == "Loud"   # Loud: analisi in alto a sinistra, punteggio al centro
+        dot_x = 18 if loud else W - 18
 
-        # spia in alto a destra: pulsa sulle battute della canzone, se le sente
-        accent = QColor.fromHsv(int(PALETTES[self.palette_name]["L"][0]), 200, 255)
+        # spia: pulsa sulle battute della canzone, se le sente
         if a.running and a.enabled and a.grid:
             P, ph, _ = a.grid
             frac = ((now - lat - ph) % P) / P
-            accent.setAlphaF(0.25 + 0.75 * math.exp(-frac * 7))
-            radius = 4 + 3 * math.exp(-frac * 7)
+            glow = 0.35 + 0.65 * math.exp(-frac * 7)
+            radius = 8 + 5 * math.exp(-frac * 7)
         else:
-            accent.setAlphaF(0.55 + 0.25 * math.sin(now * 3))
-            radius = 4
-        p.setPen(Qt.NoPen)
-        p.setBrush(accent)
-        p.drawEllipse(QPointF(W - 18, 18), radius, radius)
+            glow = 0.6 + 0.25 * math.sin(now * 3)
+            radius = 8
+        p.setOpacity(glow)
+        p.drawImage(QRectF(dot_x - radius, 18 - radius, 2 * radius, 2 * radius),
+                    glow_sprite(PALETTES[self.palette_name]["L"][0], 176))
+        p.setOpacity(1.0)
 
         # testo di stato
         mult = f"  x{self.multiplier}" if self.multiplier > 1 else ""
-        lines = [f"SCORE {self.score:,}{mult}"]
+        lines = [] if loud else [f"SCORE {self.score:,}{mult}"]
         if a.enabled and AUDIO_AVAILABLE:
             if not a.running:
                 lines.append("analysis unavailable")
@@ -812,36 +1368,184 @@ class Overlay(QWidget):
                 lines.append(f"latency {round(lat * 1000)} ms")
         elif self.bpm:
             lines.append(f"{self.bpm} bpm")
-        p.setFont(QFont("Consolas", 9))
+        lines.append(f"render {self.paint_ms:.1f} ms")
+        p.setFont(self.font_hud)
         p.setPen(QColor(255, 255, 255, 150))
         for i, text in enumerate(lines):
-            p.drawText(QRectF(W - 330, 10 + i * 16, 300, 16),
-                       Qt.AlignRight | Qt.AlignVCenter, text)
+            if loud:
+                p.drawText(QRectF(36, 10 + i * 16, 300, 16),
+                           Qt.AlignLeft | Qt.AlignVCenter, text)
+            else:
+                p.drawText(QRectF(W - 330, 10 + i * 16, 300, 16),
+                           Qt.AlignRight | Qt.AlignVCenter, text)
 
-        # giudizio dell'ultimo tap, in alto al centro
-        if self.judgement:
-            label, color, ms, offbeat, t0, points = self.judgement
-            k = (now - t0) / 0.7
+        # indicatore di energia: in che zona è la canzone adesso
+        level = a.energy_at(now - lat)
+        if level is not None:
+            y = 10 + len(lines) * 16 + 6
+            x0, w = (96, 120) if loud else (W - 150, 120)
+            p.drawText(QRectF(x0 - 60, y - 6, 54, 16), Qt.AlignRight | Qt.AlignVCenter,
+                       "energy")
+            p.fillRect(QRectF(x0, y, w, 5), QColor(255, 255, 255, 40))
+            if level >= ENERGY_PEAK:
+                fill = QColor(255, 90, 210)
+            elif level >= 0.5:
+                fill = QColor.fromHsv(int(PALETTES[self.palette_name]["L"][0]), 200, 255)
+            else:
+                fill = QColor(130, 190, 255)
+            p.fillRect(QRectF(x0, y, max(5, w * level), 5), fill)
+            p.fillRect(QRectF(x0 + w * ENERGY_PEAK, y - 3, 2, 11),
+                       QColor(255, 255, 255, 170))  # soglia del picco
+            # triangolino: intensità dell'ultimo tasto, per confrontarla con la canzone
+            if self.last_power and now - self.last_power[1] < 1.2:
+                fade = 1 - (now - self.last_power[1]) / 1.2
+                mx = round(x0 + w * self.last_power[0])
+                p.fillRect(QRectF(mx - 1, y + 7, 3, 7), QColor(255, 255, 255, int(230 * fade)))
+
+        # giudizio dell'ultimo tap, in alto al centro (in Loud c'è la colonna al centro)
+        if self.judgement and not loud:
+            j = self.judgement
+            duration = 1.0 if j["big"] else 0.7
+            k = (now - j["t0"]) / duration
             if k < 1:
                 alpha = (1 - k) ** 1.5
-                lift = 10 * k
-                c = QColor(*color)
+                lift = round(10 * k)   # pixel interi: i caratteri restano quelli in cache
+                c = QColor(*j["color"])
                 c.setAlphaF(alpha)
-                font = QFont("Segoe UI", 24, QFont.Bold)
-                font.setLetterSpacing(QFont.AbsoluteSpacing, 4)
-                p.setFont(font)
+                p.setFont(self.font_judge_big if j["big"] else self.font_judge)
                 p.setPen(c)
-                p.drawText(QRectF(0, 40 - lift, W, 40), Qt.AlignCenter, label)
-                small = QFont("Consolas", 10)
-                p.setFont(small)
-                c.setAlphaF(alpha * 0.8)
+                top = 34 if j["big"] else 40
+                height = 60 if j["big"] else 40
+                p.drawText(QRectF(0, top - lift, W, height), Qt.AlignCenter, j["label"])
+                if j["detail"]:
+                    p.setFont(self.font_detail)
+                    c.setAlphaF(alpha * 0.8)
+                    p.setPen(c)
+                    p.drawText(QRectF(0, top + height - lift, W, 20), Qt.AlignCenter,
+                               j["detail"])
+
+
+    def _draw_loud(self, p, W, H, now):
+        """Modalità Loud: punteggio grande al centro che cresce, colonna dei giudizi sopra."""
+        dt = self.frame_dt
+        # il punteggio mostrato rincorre quello vero: si vede "salire"
+        gap = self.score - self.shown_score
+        self.shown_score += gap * min(1.0, dt * 6)
+        if abs(self.score - self.shown_score) < 1:
+            self.shown_score = float(self.score)
+        shown = int(round(self.shown_score))
+
+        # più punti hai, più il numero è grande: 56 px a zero, ~145 px a 500.000
+        size = min(190.0, 56 + 30 * math.log10(1 + shown / 500))
+        size *= 1 + 0.12 * math.exp(-(now - self.score_bump) * 9)   # colpo a ogni punto
+        scale = size / SCORE_SIZE
+        cx, cy = W / 2, H / 2 + 60
+
+        # alone scuro dietro, per leggere il numero su qualsiasi sfondo
+        r = 260 + size * 2
+        p.setOpacity(0.7)
+        p.drawImage(QRectF(cx - r, cy - r * 0.8, 2 * r, 1.6 * r), shade_sprite())
+
+        # cifre: sprite già sulla GPU, scalati
+        p.setOpacity(1.0)
+        digits = [text_sprite(ch, SCORE_SIZE, SCORE_WEIGHT) for ch in f"{shown:,}"]
+        total = sum(d.width() for d in digits) / 2 * scale
+        digit_h = (digits[0].height() / 2) * scale
+        x = cx - total / 2
+        for d in digits:
+            w = d.width() / 2 * scale
+            p.drawImage(QRectF(x, cy - digit_h / 2, w, digit_h), d)
+            x += w
+
+        # moltiplicatore e combo sotto il numero
+        extra = []
+        if self.multiplier > 1:
+            extra.append(f"x{self.multiplier}")
+        if self.combo:
+            extra.append(f"combo {self.combo}")
+        if extra:
+            p.setFont(self.font_stats)
+            p.setPen(QColor(255, 255, 255, 190))
+            p.drawText(QRectF(0, round(cy + digit_h / 2 - 4), W, 24), Qt.AlignCenter,
+                       "  ·  ".join(extra))
+
+        # colonna dei giudizi: il più nuovo appena sopra il numero, i vecchi salgono e sfumano
+        self.feed = [e for e in self.feed if now - e["t0"] < FEED_LIFE]
+        bottom = cy - digit_h / 2 + 6
+        for i, e in enumerate(self.feed):
+            age = now - e["t0"]
+            img = text_sprite(e["label"], LABEL_SIZE, QFont.Bold, 5, e["color"])
+            s = 0.8 ** i * (1 + 0.3 * math.exp(-age * 12))   # i nuovi entrano con un colpo
+            w, h = img.width() / 2 * s, img.height() / 2 * s
+            target = bottom - h
+            e["y"] = target if e["y"] is None else e["y"] + (target - e["y"]) * min(1.0, dt * 14)
+            alpha = (1 - age / FEED_LIFE) ** 0.7 * 0.85 ** i
+            p.setOpacity(max(0.0, min(1.0, alpha)))
+            p.drawImage(QRectF(cx - w / 2, e["y"], w, h), img)
+            if i == 0 and (e["points"] or e["note"]):
+                detail = "  ·  ".join(x for x in (f"+{e['points']:,}" if e["points"] else "",
+                                                     e["note"]) if x)
+                p.setFont(self.font_detail)
+                c = QColor(*e["color"])
                 p.setPen(c)
-                if ms is None:
-                    detail = "tap along to the beat"
-                else:
-                    detail = (f"{ms:+.0f} ms" + ("  ·  off-beat" if offbeat else "")
-                              + (f"  ·  +{points}" if points else ""))
-                p.drawText(QRectF(0, 80 - lift, W, 20), Qt.AlignCenter, detail)
+                p.drawText(QRectF(round(cx + w / 2 + 12), round(e["y"] + h / 2 - 10), 300, 20),
+                           Qt.AlignLeft | Qt.AlignVCenter, detail)
+            bottom = e["y"] - 2
+        p.setOpacity(1.0)
+
+
+class CpuOverlay(OverlayBase, QWidget):
+    """Disegno sulla CPU: compatibile ovunque, ma pesante con tanti effetti."""
+
+    def __init__(self, screen, analyzer):
+        QWidget.__init__(self, None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
+                         Qt.Tool | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setGeometry(screen.geometry())
+        self._setup(analyzer)
+
+    def paintEvent(self, event):
+        self._render(QPainter(self), event.rect())  # Qt ritaglia già alla zona da aggiornare
+
+
+if GPU_AVAILABLE:
+    class GpuOverlay(OverlayBase, QOpenGLWindow):
+        """Disegno sulla scheda video: finestra OpenGL trasparente, composta da Windows."""
+
+        def __init__(self, screen, analyzer):
+            QOpenGLWindow.__init__(self)
+            fmt = QSurfaceFormat()
+            fmt.setAlphaBufferSize(8)   # canale alfa: trasparenza pixel per pixel
+            fmt.setSamples(4)           # bordi morbidi per anelli e testo
+            fmt.setSwapInterval(1)      # sincronizzato col monitor
+            self.setFormat(fmt)
+            self.setFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool |
+                          Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
+            g = screen.geometry()
+            # un pixel più bassa dello schermo: così Windows non la scambia per un gioco a
+            # schermo intero (che nasconderebbe barra delle applicazioni e notifiche)
+            self.setGeometry(QRect(g.x(), g.y(), g.width(), g.height() - 1))
+            self._setup(analyzer)
+            self.prewarm = True
+
+        def paintGL(self):
+            self._render(QPainter(self), self.full_rect())
+
+
+class MARGINS(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_int), ("right", ctypes.c_int),
+                ("top", ctypes.c_int), ("bottom", ctypes.c_int)]
+
+
+def make_gpu_window_transparent(hwnd):
+    """Chiede a Windows (DWM) di comporre la finestra OpenGL usando il suo canale alfa,
+    la stessa tecnica degli overlay dei giochi."""
+    try:
+        ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
+            wintypes.HWND(hwnd), ctypes.byref(MARGINS(-1, -1, -1, -1)))
+    except Exception:
+        pass
 
 
 def make_icon(on):
@@ -883,19 +1587,28 @@ def main():
 
     analyzer = BeatAnalyzer()
     analyzer.enabled = settings.value("analysis", "true") == "true"
-    overlay = Overlay(app.primaryScreen(), analyzer)
+    renderer = settings.value("renderer", RENDERERS[0])
+    if renderer not in RENDERERS:
+        renderer = RENDERERS[0]
+    use_gpu = renderer == "GPU" and GPU_AVAILABLE
+    overlay = (GpuOverlay if use_gpu else CpuOverlay)(app.primaryScreen(), analyzer)
     if settings.value("palette") in PALETTES:
         overlay.palette_name = settings.value("palette")
     if settings.value("dim") in DIM_LEVELS:
         overlay.dim_name = settings.value("dim")
     if settings.value("laser") in LASER_MODES:
         overlay.laser_mode = settings.value("laser")
+    if settings.value("mode") in MODES:
+        overlay.mode = settings.value("mode")
     try:
         overlay.best = int(settings.value("best", 0))
     except (TypeError, ValueError):
         overlay.best = 0
     overlay.on_best = lambda score: settings.setValue("best", score)
     overlay.show()
+    if use_gpu:
+        make_gpu_window_transparent(int(overlay.winId()))
+        overlay.update()   # primo fotogramma subito: carica le texture prima della sessione
     if analyzer.enabled:
         analyzer.start()
 
@@ -927,11 +1640,28 @@ def main():
         settings.setValue("laser", n)
         check_laser(n)
 
+    def set_mode(n):
+        overlay.mode = n
+        overlay.feed.clear()
+        settings.setValue("mode", n)
+        check_mode(n)
+
+    check_mode = radio_menu(menu, "Modalità (Ctrl+Alt+M)", MODES, overlay.mode, set_mode)
     radio_menu(menu, "Palette", PALETTES, overlay.palette_name, set_palette)
     check_dim = radio_menu(menu, "Scurisci schermo (Ctrl+Alt+D)", DIM_LEVELS,
                            overlay.dim_name, set_dim)
     check_laser = radio_menu(menu, "Laser (Ctrl+Alt+L)", LASER_MODES,
                              overlay.laser_mode, set_laser)
+
+    def set_renderer(n):
+        if n == renderer:
+            return
+        settings.setValue("renderer", n)
+        settings.sync()
+        restart_app()  # il motore di disegno si sceglie all'avvio
+
+    radio_menu(menu, "Rendering", RENDERERS if GPU_AVAILABLE else RENDERERS[1:],
+               renderer if use_gpu else RENDERERS[1], set_renderer)
 
     def cycle(options, current, setter):
         options = list(options)
@@ -989,17 +1719,19 @@ def main():
     actions = HotkeyActions(
         toggle=lambda: set_armed(not overlay.armed),
         cycle_dim=lambda: cycle(DIM_LEVELS, overlay.dim_name, set_dim),
-        cycle_laser=lambda: cycle(LASER_MODES, overlay.laser_mode, set_laser))
+        cycle_laser=lambda: cycle(LASER_MODES, overlay.laser_mode, set_laser),
+        cycle_mode=lambda: cycle(MODES, overlay.mode, set_mode))
     bridge.toggle.connect(actions.toggle, Qt.QueuedConnection)
     bridge.cycle_dim.connect(actions.cycle_dim, Qt.QueuedConnection)
     bridge.cycle_laser.connect(actions.cycle_laser, Qt.QueuedConnection)
+    bridge.cycle_mode.connect(actions.cycle_mode, Qt.QueuedConnection)
     act_toggle.triggered.connect(lambda: set_armed(not overlay.armed))
     tray.activated.connect(lambda reason: reason == QSystemTrayIcon.Trigger
                            and set_armed(not overlay.armed))
 
     # ---------------------------------------------------------- scorciatoie globali
     hotkeys = HotkeyThread({VK_F: bridge.toggle, VK_D: bridge.cycle_dim,
-                            VK_L: bridge.cycle_laser})
+                            VK_L: bridge.cycle_laser, VK_M: bridge.cycle_mode})
     hotkeys.start()
     hotkeys.ready.wait(2)
 
@@ -1007,8 +1739,15 @@ def main():
         if overlay.armed:
             set_armed(False)
         hotkeys.stop()
+        hotkeys.join(1)   # libera le scorciatoie prima che una nuova istanza le registri
         analyzer.stop()
+        tray.hide()
         app.quit()
+
+    def restart_app():
+        quit_app()
+        subprocess.Popen([sys.executable, os.path.abspath(__file__)],
+                         cwd=os.path.dirname(os.path.abspath(__file__)))
 
     act_quit.triggered.connect(quit_app)
 
