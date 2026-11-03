@@ -1,5 +1,7 @@
 # Edge Flash
 
+![Flashes and lasers firing from the screen edges in time with music](assets/Preview_1.gif)
+
 Turn your keyboard into concert lights while you listen to music.
 
 Edge Flash is a transparent, click-through overlay for Windows that sits on top of everything. Switch it on and every key fires a flash or a laser from the edge of the screen. It also listens to what your PC is playing, finds the beat, and tells you if you are tapping in time, rhythm-game style.
@@ -19,6 +21,8 @@ Edge Flash is a transparent, click-through overlay for Windows that sits on top 
 - **Automatic latency calibration**, Bluetooth headphones included
 - **Session score** with combo multiplier, a random end-of-session comment and a saved personal best
 - 4 color palettes
+
+![End-of-session screen with comment and score](assets/Preview_2.gif)
 
 ## Controls
 
